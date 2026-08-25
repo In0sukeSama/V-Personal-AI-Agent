@@ -1,0 +1,10 @@
+openai>=1.50.0
+python-dotenv>=1.0.0
+faster-whisper>=1.0.0
+sounddevice>=0.4.6
+numpy>=1.26.0
+scipy>=1.11.0
+requests>=2.31.0
+pygame>=2.6.0
+pyttsx3>=2.90
+openwakeword>=0.6.0
