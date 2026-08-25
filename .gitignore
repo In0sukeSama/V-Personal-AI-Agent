@@ -10,9 +10,11 @@
 # ==========================================
 # V Personal Data
 # ==========================================
-
+    
 memory.json
+memory.json.bak
 conversation_history.json
+conversation_history.json.bak
 deleted_files/
 
 

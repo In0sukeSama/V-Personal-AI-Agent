@@ -378,6 +378,8 @@ def _make_test_brain(responses):
     import brain as brain_module
     v = brain_module.JarvisBrain.__new__(brain_module.JarvisBrain)
     v.client = _CountingScriptedClient(responses)
+    v.session_summary = ""
+    v.provenance = []
     v.history = [v._build_system_message()]
     v.pending_actions = []
     return v

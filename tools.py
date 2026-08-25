@@ -20,23 +20,7 @@ import shutil
 import requests
 
 from tool_registry import register_tool, RISK_SAFE, RISK_LOW, RISK_CONSEQUENTIAL, RISK_DESTRUCTIVE
-
-MEMORY_FILE = os.path.join(os.path.dirname(__file__), "memory.json")
-
-
-def _load_memory() -> dict:
-    if not os.path.exists(MEMORY_FILE):
-        return {}
-    try:
-        with open(MEMORY_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_memory(data: dict):
-    with open(MEMORY_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+import memory_store
 
 
 @register_tool(
@@ -65,11 +49,10 @@ def _save_memory(data: dict):
     risk=RISK_LOW,
 )
 def remember(key: str, value: str) -> str:
-    """Save a fact to long-term memory, e.g. remember('github_username', 'jagat123')."""
-    data = _load_memory()
-    data[key] = value
-    _save_memory(data)
-    return f"Locked it in - {key} is now {value}."
+    """Save a fact to long-term memory, e.g. remember('github_username', 'jagat123').
+    Delegates to memory_store, which handles categorization and provenance -
+    this tool's job is just being the thing the model calls."""
+    return memory_store.remember(key, value)
 
 
 @register_tool(
@@ -97,21 +80,7 @@ def recall(key: str) -> str:
     """Retrieve a previously remembered fact by key. Matching is fuzzy: falls
     back to substring matching against stored keys if there's no exact hit,
     since the model may not phrase the same key identically across turns."""
-    data = _load_memory()
-
-    # Exact match first
-    if key in data:
-        return f"{key}: {data[key]}"
-
-    # Fuzzy fallback: normalize (lowercase, strip spaces/underscores) and
-    # check for substring overlap in either direction against stored keys.
-    key_norm = key.lower().replace(" ", "").replace("_", "")
-    for stored_key, value in data.items():
-        stored_norm = stored_key.lower().replace(" ", "").replace("_", "")
-        if key_norm in stored_norm or stored_norm in key_norm:
-            return f"{stored_key}: {value}"
-
-    return f"No memory logged for '{key}' yet."
+    return memory_store.recall(key)
 
 
 @register_tool(
@@ -127,11 +96,7 @@ def recall(key: str) -> str:
 )
 def list_memories() -> str:
     """Return every key-value pair currently in long-term memory."""
-    data = _load_memory()
-    if not data:
-        return "Nothing saved in memory yet."
-    lines = [f"{k}: {v}" for k, v in data.items()]
-    return "\n".join(lines)
+    return memory_store.list_memories()
 
 
 # ---------------------------------------------------------------------------

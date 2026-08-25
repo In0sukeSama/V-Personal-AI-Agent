@@ -14,13 +14,29 @@ import re
 from openai import OpenAI
 import tools  # noqa: F401 - importing triggers each tool's @register_tool decorator
 from tool_registry import registry
+import memory_store
 
 MODEL = "openai/gpt-oss-120b"  # Groq's free-tier flagship model (llama-3.3-70b was deprecated)
 
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "conversation_history.json")
-MAX_SAVED_TURNS = 40  # keep the most recent N user+assistant messages across sessions
+HISTORY_BACKUP_FILE = os.path.join(os.path.dirname(__file__), "conversation_history.json.bak")
+MAX_SAVED_TURNS = 40  # keep the most recent N user+assistant turns across sessions
 
 PENDING_ACTION_TIMEOUT_SECONDS = 120  # a confirmation prompt goes stale after this long
+
+# Context/memory management config - deliberately simple (no DB, no
+# embeddings). Configurable via env vars, reasonable defaults otherwise.
+CONTEXT_TOKEN_BUDGET = int(os.getenv("V_CONTEXT_TOKEN_BUDGET", "6000"))
+RECENT_MESSAGES_KEEP = int(os.getenv("V_RECENT_MESSAGES_KEEP", "12"))  # never trimmed/summarized
+MEMORY_RETRIEVAL_LIMIT = int(os.getenv("V_MEMORY_RETRIEVAL_LIMIT", "5"))
+
+# Response generation controls - the free-tier Groq model has been observed
+# to occasionally ramble into long, repeated text on open-ended replies with
+# no bound on length. max_tokens caps how long any single reply can get;
+# frequency_penalty directly discourages the model from repeating the same
+# phrase over and over within one response.
+RESPONSE_MAX_TOKENS = int(os.getenv("V_RESPONSE_MAX_TOKENS", "300"))
+RESPONSE_FREQUENCY_PENALTY = float(os.getenv("V_RESPONSE_FREQUENCY_PENALTY", "0.6"))
 
 # Words/phrases that count as confirming or rejecting a pending action. Kept
 # as simple substring checks rather than a classifier - good enough for a
@@ -133,6 +149,13 @@ from then on use it automatically without asking again.
 Deleting a file moves it to a local quarantine folder, not a permanent erase - so on a clear
 deletion request, act without excessive double-checking. If the request or target file is
 ambiguous, or could reasonably be important, clarify first.
+
+CONTEXT AND MEMORY
+Recent conversation is context, not proof of anything. Your own past replies are not evidence
+that an action actually happened - only an actual tool result establishes that. If you're
+unsure whether something you said earlier actually went through, check rather than assume it
+did. Long-term memory holds persistent facts the user has told you; it's separate from the
+flow of conversation and won't include everything discussed recently.
 """
 
 
@@ -144,62 +167,117 @@ class JarvisBrain:
             api_key=api_key or os.getenv("GROQ_API_KEY"),
             base_url="https://api.groq.com/openai/v1",
         )
-        # System message is NOT stored statically - it's rebuilt fresh on every
-        # call via _build_system_message(), so memory updates are reflected
-        # immediately without relying on the model remembering to call recall.
+        # Full provenance-tagged turn log (persisted to disk, capped at save
+        # time) - separate from self.history, which is the raw OpenAI-format
+        # list actually sent to the API and subject to live context trimming.
+        self.session_summary, self.provenance = self._load_session_history()
+
+        # System message is NOT stored statically - it's rebuilt fresh on
+        # every call via _build_system_message(), so memory updates are
+        # reflected immediately without relying on the model remembering to
+        # call recall.
         self.history = [self._build_system_message()]
-        self.history.extend(self._load_past_turns())
+        self.history.extend({"role": t["role"], "content": t["content"]} for t in self.provenance)
+
         # A list of blocked actions awaiting one combined confirmation. Empty
         # list = nothing pending. A single request can produce more than one
         # (e.g. "delete 4.txt and 5.txt"), all confirmed or rejected together.
+        # Deliberately in-memory only, never persisted - a confirmation
+        # should expire when V restarts, not survive across sessions.
         self.pending_actions = []
 
-    @staticmethod
-    def _build_system_message() -> dict:
-        """Build the system message with current memory contents injected
-        directly into it. This guarantees known facts are always visible to
-        the model without depending on it reliably choosing to call recall -
-        tool-calling for retrieval is a courtesy fallback, not the only path."""
-        memory_block = ""
+    def _build_system_message(self, user_text: str = None) -> dict:
+        """Build the system message with SELECTIVELY relevant memory facts
+        injected, plus the session summary if one exists. Only a small,
+        relevant subset of memory is injected (not the entire store) - a
+        "recall"/"list_memories" tool call is still available as a fallback
+        for anything the relevance filter misses."""
+        blocks = []
+
         try:
-            memory_data = tools._load_memory()
-            if memory_data:
-                facts = "\n".join(f"- {k}: {v}" for k, v in memory_data.items())
-                memory_block = (
-                    "\n\nKNOWN FACTS ABOUT THE USER (already saved in memory - use "
+            relevant = memory_store.get_relevant(user_text or "", limit=MEMORY_RETRIEVAL_LIMIT)
+            if relevant:
+                facts = "\n".join(f"- {m['key']}: {m['value']}" for m in relevant)
+                blocks.append(
+                    "KNOWN FACTS RELEVANT TO THIS REQUEST (already saved in memory - use "
                     "these directly, don't ask for them again):\n" + facts
                 )
         except Exception:
             pass
-        return {"role": "system", "content": SYSTEM_PROMPT + memory_block}
+
+        if self.session_summary:
+            blocks.append("SESSION SUMMARY (condensed earlier context):\n" + self.session_summary)
+
+        content = SYSTEM_PROMPT
+        if blocks:
+            content += "\n\n" + "\n\n".join(blocks)
+        return {"role": "system", "content": content}
 
     @staticmethod
-    def _load_past_turns() -> list:
-        """Load recent plain user/assistant turns from previous sessions, so V
-        has continuity across restarts. Tool-call messages aren't persisted -
-        only the final plain-text exchanges - to keep the saved file simple
-        and avoid replaying stale tool_call_ids from a previous run."""
+    def _load_session_history() -> tuple:
+        """Load conversation_history.json, transparently migrating the old
+        bare-list format if found. Returns (summary_string, list_of_turn_dicts).
+        Never deletes the original file without first writing a backup."""
         if not os.path.exists(HISTORY_FILE):
-            return []
+            return "", []
+
         try:
             with open(HISTORY_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
         except Exception:
-            return []
+            return "", []
+
+        if isinstance(data, dict) and data.get("version") == 2:
+            return data.get("summary", ""), data.get("turns", [])
+
+        if isinstance(data, list):
+            # Old format: bare list of {"role": ..., "content": ...}. Back up
+            # before migrating - nothing existing is silently discarded.
+            try:
+                if not os.path.exists(HISTORY_BACKUP_FILE):
+                    with open(HISTORY_BACKUP_FILE, "w") as f:
+                        json.dump(data, f, indent=2)
+            except Exception:
+                pass
+
+            now = time.time()
+            migrated = []
+            for turn in data:
+                role = turn.get("role")
+                content = turn.get("content")
+                if not isinstance(content, str) or not content:
+                    continue
+                if role == "user":
+                    migrated.append({"role": "user", "content": content, "source": "user", "verified": True, "ts": now})
+                elif role == "assistant":
+                    # Legacy replies have no recorded provenance - treat as
+                    # ungrounded conversational text, not proof anything
+                    # happened, per the core trust rule.
+                    migrated.append({"role": "assistant", "content": content, "source": "model", "grounded": False, "tool_outcome": "none", "ts": now})
+            return "", migrated
+
+        return "", []
 
     def _save_turns(self):
-        """Persist only plain user/assistant text turns (no tool-call noise)."""
-        plain_turns = [
-            m for m in self.history
-            if m.get("role") in ("user", "assistant")
-            and isinstance(m.get("content"), str)
-            and m.get("content")
-        ]
+        """Persist provenance-tagged turns plus the session summary. Tool
+        call/result messages are never persisted - only plain text turns -
+        so a future session never replays stale tool_call_ids."""
         try:
             with open(HISTORY_FILE, "w") as f:
-                json.dump(plain_turns[-MAX_SAVED_TURNS:], f, indent=2)
+                json.dump({
+                    "version": 2,
+                    "summary": self.session_summary,
+                    "turns": self.provenance[-MAX_SAVED_TURNS:],
+                }, f, indent=2)
         except Exception as e:
             print(f"[Couldn't save conversation history: {e}]")
+
+    def _record_turn(self, role: str, content: str, **provenance_fields):
+        """Append a plain text turn to both the live working-memory history
+        (self.history, what's actually sent to the API) and the persisted
+        provenance log (self.provenance, what's saved to disk) in lockstep."""
+        self.history.append({"role": role, "content": content})
+        self.provenance.append({"role": role, "content": content, "ts": time.time(), **provenance_fields})
 
     # Friendly verb phrasing for known consequential tools - purely cosmetic
     # text generation for the confirmation prompt, not permission logic (the
@@ -250,6 +328,93 @@ class JarvisBrain:
 
         return f"That'll {'; also '.join(clauses)}. Should I go ahead with all of it?"
 
+    @staticmethod
+    def _estimate_tokens(messages: list) -> int:
+        """Rough token estimate (chars/4) - good enough for a budget trigger,
+        not meant to be exact. Avoids adding a tokenizer dependency."""
+        return sum(len(json.dumps(m, default=str)) for m in messages) // 4
+
+    def _summarize_turns(self, turns: list) -> str:
+        """Condense a block of old plain-text turns into a short summary via
+        ONE model call. Only called when the context budget is actually
+        exceeded - not on every turn. The prompt explicitly enforces the
+        core trust rule: only phrase something as done if it was actually
+        tool-confirmed, never because V previously claimed it in prose."""
+        transcript = "\n".join(f"{t['role']}: {t['content']}" for t in turns)
+        instruction = (
+            "Condense the following conversation excerpt into a short factual summary "
+            "(3-6 sentences). Capture: the current task, decisions made, important "
+            "user-provided information, and any unresolved questions. "
+            "CRITICAL: do not state that an action (deleting a file, sending something, "
+            "opening something, etc.) succeeded unless the excerpt shows clear evidence "
+            "of that outcome. If an action was only requested or discussed but its result "
+            "is unclear, phrase it as 'was requested' or 'was attempted', not as done.\n\n"
+            f"Conversation excerpt:\n{transcript}"
+        )
+        try:
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": instruction}],
+                max_tokens=RESPONSE_MAX_TOKENS,
+                frequency_penalty=RESPONSE_FREQUENCY_PENALTY,
+            )
+            return (response.choices[0].message.content or "").strip()
+        except Exception:
+            # If summarization itself fails, better to lose old detail than
+            # crash the interaction - the recent tail is still intact.
+            return ""
+
+    def _apply_context_budget(self):
+        """Keep the live working-memory context (self.history, what's
+        actually sent to the API) within a token budget. Runs once at the
+        start of each ask() call - never mid tool-call-loop, so an active
+        multi-tool exchange is never disturbed.
+
+        Order of operations (cheapest/safest first):
+          1. If under budget, do nothing.
+          2. Strip old tool-call noise (assistant tool_call messages + their
+             tool-role results) that's older than the protected recent tail -
+             this is pure noise once a turn is finished, never needed again.
+          3. If still over budget, summarize the oldest remaining plain
+             turns via one model call, fold that into the running session
+             summary, and drop those raw messages from working memory (they
+             remain fully available in self.provenance/conversation_history.json
+             regardless - trimming only affects what's sent to the API).
+        """
+        body = self.history[1:]  # everything except the system message
+        if self._estimate_tokens(body) <= CONTEXT_TOKEN_BUDGET:
+            return
+
+        if len(body) > RECENT_MESSAGES_KEEP:
+            head, tail = body[:-RECENT_MESSAGES_KEEP], body[-RECENT_MESSAGES_KEEP:]
+        else:
+            head, tail = [], body
+
+        # Step 2: strip tool-call noise from the older portion. Both sides of
+        # any tool_call_id relationship (the assistant message that made the
+        # call, and the tool-role messages answering it) are always removed
+        # together here, since this only ever runs on already-completed turns.
+        head = [
+            m for m in head
+            if m.get("role") != "tool" and not (m.get("role") == "assistant" and m.get("tool_calls"))
+        ]
+
+        if self._estimate_tokens(head + tail) <= CONTEXT_TOKEN_BUDGET:
+            self.history = [self.history[0]] + head + tail
+            return
+
+        # Step 3: still over budget - summarize what's left of the old
+        # portion (by now just plain user/assistant text turns) and drop it
+        # from live working memory. Nothing is lost from disk - the full
+        # turn log is still persisted separately in self.provenance.
+        plain_head = [m for m in head if isinstance(m.get("content"), str) and m.get("content")]
+        if plain_head:
+            addition = self._summarize_turns(plain_head)
+            if addition:
+                self.session_summary = (self.session_summary + "\n" + addition).strip() if self.session_summary else addition
+
+        self.history = [self.history[0]] + tail
+
     def _check_pending_action(self, user_text: str) -> str:
         """If there's a pending confirmation (possibly covering several
         actions), decide whether this message confirms it, rejects it, or is
@@ -283,10 +448,14 @@ class JarvisBrain:
 
     def ask(self, user_text: str) -> str:
         """Send user text to Groq, handle any tool calls, return final reply text."""
-        # Refresh the system message with current memory contents before every
-        # call - if the user told her something new mid-conversation, it's
-        # reflected on the very next turn without needing a restart.
-        self.history[0] = self._build_system_message()
+        # Refresh the system message with memory relevant to THIS message
+        # (not the entire store) before every call, and fold in the session
+        # summary if one exists.
+        self.history[0] = self._build_system_message(user_text)
+
+        # Keep live working memory within budget before adding this turn -
+        # never runs mid tool-call-loop, only at the start of a fresh request.
+        self._apply_context_budget()
 
         pending_status = self._check_pending_action(user_text)
 
@@ -294,10 +463,12 @@ class JarvisBrain:
             actions = self.pending_actions
             self.pending_actions = []
             results = []
+            any_success = False
             for action in actions:
                 outcome = registry.execute_confirmed(action)
                 if outcome["success"]:
                     results.append(outcome["result"])
+                    any_success = True
                 else:
                     results.append(f"Ran into a problem with {self._describe_target(action)}: {outcome['error']}")
             # Deterministic reply, built directly from each tool's own result -
@@ -308,15 +479,18 @@ class JarvisBrain:
             # producing a natural reply. Anywhere correctness matters here,
             # V's response is built in code, not generated.
             final_text = " ".join(results)
-            self.history.append({"role": "user", "content": user_text})
-            self.history.append({"role": "assistant", "content": final_text})
+            self._record_turn("user", user_text, source="user", verified=True)
+            self._record_turn(
+                "assistant", final_text, source="model",
+                grounded=True, tool_outcome="success" if any_success else "error",
+            )
             self._save_turns()
             return final_text
 
         elif pending_status == "rejected":
             final_text = "Cancelled - didn't touch it. Anything else?"
-            self.history.append({"role": "user", "content": user_text})
-            self.history.append({"role": "assistant", "content": final_text})
+            self._record_turn("user", user_text, source="user", verified=True)
+            self._record_turn("assistant", final_text, source="model", grounded=True, tool_outcome="none")
             self._save_turns()
             return final_text
 
@@ -326,17 +500,19 @@ class JarvisBrain:
             # words might not even be "yes" (e.g. they moved on and asked
             # something else while the window lapsed). Just drop the stale
             # pending action and fall through to normal processing.
-            self.history.append({"role": "user", "content": user_text})
+            self._record_turn("user", user_text, source="user", verified=True)
 
         else:
             # No pending action, or an unrelated message superseded one -
             # ordinary request, handled normally below.
-            self.history.append({"role": "user", "content": user_text})
+            self._record_turn("user", user_text, source="user", verified=True)
 
         response = self.client.chat.completions.create(
             model=MODEL,
             messages=self.history,
             tools=registry.get_llm_tools(),
+            max_tokens=RESPONSE_MAX_TOKENS,
+            frequency_penalty=RESPONSE_FREQUENCY_PENALTY,
         )
         message = response.choices[0].message
 
@@ -344,6 +520,8 @@ class JarvisBrain:
         awaiting_confirmation = False
         confirmation_message = None
         batch_pending_actions = []
+        tool_calls_happened = False
+        last_tool_outcome_type = "none"  # none | success | error | timeout
 
         # Keep handling tool calls until the model gives a final text answer
         while message.tool_calls:
@@ -374,8 +552,10 @@ class JarvisBrain:
                     )
                 else:
                     outcome = registry.execute(tool_call.function.name, args)
+                    tool_calls_happened = True
                     if outcome["success"]:
                         result_text = outcome["result"]
+                        last_tool_outcome_type = "success"
                     elif outcome.get("error_type") == "confirmation_required":
                         batch_pending_actions.append(outcome["pending_action"])
                         result_text = outcome["message"]
@@ -383,8 +563,10 @@ class JarvisBrain:
                         awaiting_confirmation = True
                     elif outcome.get("error_type") == "timeout":
                         result_text = outcome["message"]
+                        last_tool_outcome_type = "timeout"
                     else:
                         result_text = f"Error: {outcome['error']}"
+                        last_tool_outcome_type = "error"
 
                 last_tool_result = result_text
                 self.history.append({
@@ -413,11 +595,14 @@ class JarvisBrain:
                 model=MODEL,
                 messages=self.history,
                 tools=registry.get_llm_tools(),
+                max_tokens=RESPONSE_MAX_TOKENS,
+                frequency_penalty=RESPONSE_FREQUENCY_PENALTY,
             )
             message = response.choices[0].message
 
         if confirmation_message is not None:
             final_text = confirmation_message
+            grounded, tool_outcome_prov = True, "confirmation_required"
         else:
             final_text = (message.content or "").strip()
             if not final_text and last_tool_result:
@@ -425,7 +610,13 @@ class JarvisBrain:
                 # never let V go silent after actually doing something. Fall back
                 # to the tool's own result message rather than saying nothing.
                 final_text = last_tool_result
+            grounded = tool_calls_happened
+            tool_outcome_prov = last_tool_outcome_type
 
         self.history.append({"role": "assistant", "content": final_text})
+        self.provenance.append({
+            "role": "assistant", "content": final_text, "source": "model",
+            "grounded": grounded, "tool_outcome": tool_outcome_prov, "ts": time.time(),
+        })
         self._save_turns()
         return final_text
