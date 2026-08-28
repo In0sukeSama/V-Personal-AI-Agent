@@ -241,49 +241,20 @@ def test_action_verification_real_success_is_marked_grounded():
     import brain as brain_module
     import tools
     from tool_registry import registry, Tool, RISK_SAFE
+    from test_helpers import FakeProvider, make_tool_call_response, make_text_response
 
     def ok_tool():
         return "genuinely succeeded"
 
     registry.register(Tool(name="__ctx_test_ok__", description="", parameters={"type": "object", "properties": {}, "required": []}, handler=ok_tool, risk=RISK_SAFE))
 
-    class FakeMessage:
-        def __init__(self, content, tool_calls=None):
-            self.content = content
-            self.tool_calls = tool_calls
-        def model_dump(self, exclude_none=True):
-            return {"role": "assistant", "content": self.content}
-
-    class FakeToolCall:
-        def __init__(self, name, args_json, call_id):
-            self.id = call_id
-            self.function = type("F", (), {"name": name, "arguments": args_json})()
-
-    class FakeChoice:
-        def __init__(self, message):
-            self.message = message
-
-    class FakeResponse:
-        def __init__(self, message):
-            self.choices = [FakeChoice(message)]
-
-    class ScriptedClient:
-        def __init__(self, responses):
-            self._responses = iter(responses)
-            class Completions:
-                def create(inner_self, **kwargs):
-                    return next(self._responses)
-            class Chat:
-                completions = Completions()
-            self.chat = Chat()
-
     v = brain_module.JarvisBrain.__new__(brain_module.JarvisBrain)
     v.session_summary = ""
     v.provenance = []
     v.pending_actions = []
-    v.client = ScriptedClient([
-        FakeResponse(FakeMessage(None, tool_calls=[FakeToolCall("__ctx_test_ok__", "{}", "c1")])),
-        FakeResponse(FakeMessage("All set.")),
+    v.provider = FakeProvider([
+        make_tool_call_response([("__ctx_test_ok__", {}, "c1")]),
+        make_text_response("All set."),
     ])
     v.history = [v._build_system_message()]
 
@@ -308,7 +279,8 @@ def test_context_budget_trims_old_tool_noise():
     v.session_summary = ""
     v.provenance = []
     v.pending_actions = []
-    v.client = None
+    from test_helpers import FakeProvider, make_text_response
+    v.provider = FakeProvider([make_text_response("condensed summary of old turns") for _ in range(10)])
     v.history = [{"role": "system", "content": "sys"}]
 
     old_budget = brain_module.CONTEXT_TOKEN_BUDGET
@@ -344,7 +316,8 @@ def test_context_budget_preserves_recent_messages():
     v.session_summary = ""
     v.provenance = []
     v.pending_actions = []
-    v.client = None
+    from test_helpers import FakeProvider, make_text_response
+    v.provider = FakeProvider([make_text_response("condensed summary of old turns") for _ in range(10)])
     v.history = [{"role": "system", "content": "sys"}]
 
     old_budget = brain_module.CONTEXT_TOKEN_BUDGET
@@ -370,7 +343,8 @@ def test_context_budget_no_trim_when_under_budget():
     v.session_summary = ""
     v.provenance = []
     v.pending_actions = []
-    v.client = None
+    from test_helpers import FakeProvider, make_text_response
+    v.provider = FakeProvider([make_text_response("condensed summary of old turns") for _ in range(10)])
     v.history = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
     before = list(v.history)
     v._apply_context_budget()

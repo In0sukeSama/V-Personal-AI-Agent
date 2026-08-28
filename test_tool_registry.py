@@ -6,6 +6,7 @@ Run with: python test_tool_registry.py
 """
 
 from tool_registry import ToolRegistry, Tool, register_tool, registry
+import json
 
 
 def test_register_and_execute():
@@ -333,51 +334,13 @@ def test_multi_tool_batch_stops_at_confirmation_gate():
 # PendingAction, with zero additional model calls.)
 # ---------------------------------------------------------------------------
 
-class _FakeMessage:
-    def __init__(self, content, tool_calls=None):
-        self.content = content
-        self.tool_calls = tool_calls
-    def model_dump(self, exclude_none=True):
-        return {"role": "assistant", "content": self.content}
-
-
-class _FakeToolCall:
-    def __init__(self, name, args_json, call_id):
-        self.id = call_id
-        self.function = type("F", (), {"name": name, "arguments": args_json})()
-
-
-class _FakeChoice:
-    def __init__(self, message):
-        self.message = message
-
-
-class _FakeResponse:
-    def __init__(self, message):
-        self.choices = [_FakeChoice(message)]
-
-
-class _CountingScriptedClient:
-    """Fake OpenAI-compatible client that returns scripted responses in order
-    and counts how many times .create() was invoked - used to prove the
-    confirmation flow makes exactly one model call, not two."""
-    def __init__(self, responses):
-        self._responses = iter(responses)
-        self.call_count = 0
-        outer = self
-        class Completions:
-            def create(inner_self, **kwargs):
-                outer.call_count += 1
-                return next(outer._responses)
-        class Chat:
-            completions = Completions()
-        self.chat = Chat()
+from test_helpers import FakeProvider, make_tool_call_response, make_text_response
 
 
 def _make_test_brain(responses):
     import brain as brain_module
     v = brain_module.JarvisBrain.__new__(brain_module.JarvisBrain)
-    v.client = _CountingScriptedClient(responses)
+    v.provider = FakeProvider(responses)
     v.session_summary = ""
     v.provenance = []
     v.history = [v._build_system_message()]
@@ -399,13 +362,13 @@ def test_confirmation_bug_one_confirmation_only():
         handler=spy_delete, risk=RISK_DESTRUCTIVE,
     ))
 
-    responses = [_FakeResponse(_FakeMessage(None, tool_calls=[
-        _FakeToolCall("__test_confirm_delete__", '{"path": "now_me.txt"}', "c1")
-    ]))]
+    responses = [make_tool_call_response([
+        ("__test_confirm_delete__", json.loads('{"path": "now_me.txt"}'), "c1")
+    ])]
     v = _make_test_brain(responses)
     reply = v.ask('delete now_me.txt')
 
-    assert v.client.call_count == 1, f"Expected exactly 1 model call, got {v.client.call_count}"
+    assert v.provider.call_count == 1, f"Expected exactly 1 model call, got {v.provider.call_count}"
     assert reply.count("?") <= 1, f"Expected a single clean question, got: {reply}"
     assert "now_me.txt" in reply
     print("test_confirmation_bug_one_confirmation_only: PASS")
@@ -424,9 +387,9 @@ def test_confirmation_bug_no_repeated_tool_calls():
         name="__test_confirm_delete2__", description="", parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
         handler=spy, risk=RISK_DESTRUCTIVE,
     ))
-    responses = [_FakeResponse(_FakeMessage(None, tool_calls=[
-        _FakeToolCall("__test_confirm_delete2__", '{"path": "x.txt"}', "c1")
-    ]))]
+    responses = [make_tool_call_response([
+        ("__test_confirm_delete2__", json.loads('{"path": "x.txt"}'), "c1")
+    ])]
     v = _make_test_brain(responses)
     v.ask("delete x.txt")
     assert calls["n"] == 0
@@ -446,12 +409,12 @@ def test_confirmation_bug_confirmed_executes_once():
         name="__test_confirm_delete3__", description="", parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
         handler=spy, risk=RISK_DESTRUCTIVE,
     ))
-    responses = [_FakeResponse(_FakeMessage(None, tool_calls=[
-        _FakeToolCall("__test_confirm_delete3__", '{"path": "y.txt"}', "c1")
-    ]))]
+    responses = [make_tool_call_response([
+        ("__test_confirm_delete3__", json.loads('{"path": "y.txt"}'), "c1")
+    ])]
     v = _make_test_brain(responses)
     v.ask("delete y.txt")
-    v.client = _CountingScriptedClient([_FakeResponse(_FakeMessage("Done."))])
+    v.provider = FakeProvider([make_text_response("Done.")])
     v.ask("yes")
     assert calls["n"] == 1
     assert v.pending_actions == []
@@ -475,25 +438,25 @@ def test_confirmation_bug_second_action_no_stale_state():
     ))
 
     # File A
-    v = _make_test_brain([_FakeResponse(_FakeMessage(None, tool_calls=[
-        _FakeToolCall("__test_confirm_delete4__", '{"path": "fileA.txt"}', "c1")
-    ]))])
+    v = _make_test_brain([make_tool_call_response([
+        ("__test_confirm_delete4__", json.loads('{"path": "fileA.txt"}'), "c1")
+    ])])
     v.ask("delete fileA.txt")
-    v.client = _CountingScriptedClient([_FakeResponse(_FakeMessage("Done with A."))])
+    v.provider = FakeProvider([make_text_response("Done with A.")])
     v.ask("yes")
     assert calls == ["fileA.txt"]
     assert v.pending_actions == []
 
     # File B - fresh request
-    v.client = _CountingScriptedClient([_FakeResponse(_FakeMessage(None, tool_calls=[
-        _FakeToolCall("__test_confirm_delete4__", '{"path": "fileB.txt"}', "c2")
-    ]))])
+    v.provider = FakeProvider([make_tool_call_response([
+        ("__test_confirm_delete4__", json.loads('{"path": "fileB.txt"}'), "c2")
+    ])])
     reply = v.ask("delete fileB.txt")
     assert v.pending_actions
     assert v.pending_actions[0].arguments["path"] == "fileB.txt"
     assert calls == ["fileA.txt"], "fileB must not have executed yet"
 
-    v.client = _CountingScriptedClient([_FakeResponse(_FakeMessage("Done with B."))])
+    v.provider = FakeProvider([make_text_response("Done with B.")])
     v.ask("yes")
     assert calls == ["fileA.txt", "fileB.txt"]
     assert v.pending_actions == []
@@ -511,11 +474,11 @@ def test_confirmation_bug_rejection_zero_calls():
         name="__test_confirm_delete5__", description="", parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
         handler=spy, risk=RISK_DESTRUCTIVE,
     ))
-    v = _make_test_brain([_FakeResponse(_FakeMessage(None, tool_calls=[
-        _FakeToolCall("__test_confirm_delete5__", '{"path": "z.txt"}', "c1")
-    ]))])
+    v = _make_test_brain([make_tool_call_response([
+        ("__test_confirm_delete5__", json.loads('{"path": "z.txt"}'), "c1")
+    ])])
     v.ask("delete z.txt")
-    v.client = _CountingScriptedClient([_FakeResponse(_FakeMessage("Cancelled."))])
+    v.provider = FakeProvider([make_text_response("Cancelled.")])
     v.ask("no")
     assert calls["n"] == 0
     assert v.pending_actions == []
@@ -533,11 +496,11 @@ def test_confirmation_bug_superseding_request():
         name="__test_confirm_delete6__", description="", parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
         handler=spy, risk=RISK_DESTRUCTIVE,
     ))
-    v = _make_test_brain([_FakeResponse(_FakeMessage(None, tool_calls=[
-        _FakeToolCall("__test_confirm_delete6__", '{"path": "w.txt"}', "c1")
-    ]))])
+    v = _make_test_brain([make_tool_call_response([
+        ("__test_confirm_delete6__", json.loads('{"path": "w.txt"}'), "c1")
+    ])])
     v.ask("delete w.txt")
-    v.client = _CountingScriptedClient([_FakeResponse(_FakeMessage("Sure, opening Spotify."))])
+    v.provider = FakeProvider([make_text_response("Sure, opening Spotify.")])
     v.ask("actually open spotify")
     assert calls["n"] == 0
     assert v.pending_actions == []
@@ -556,12 +519,12 @@ def test_confirmation_bug_expiration():
         name="__test_confirm_delete7__", description="", parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
         handler=spy, risk=RISK_DESTRUCTIVE,
     ))
-    v = _make_test_brain([_FakeResponse(_FakeMessage(None, tool_calls=[
-        _FakeToolCall("__test_confirm_delete7__", '{"path": "old.txt"}', "c1")
-    ]))])
+    v = _make_test_brain([make_tool_call_response([
+        ("__test_confirm_delete7__", json.loads('{"path": "old.txt"}'), "c1")
+    ])])
     v.ask("delete old.txt")
     v.pending_actions[0].created_at -= (brain_module.PENDING_ACTION_TIMEOUT_SECONDS + 10)
-    v.client = _CountingScriptedClient([_FakeResponse(_FakeMessage("That expired."))])
+    v.provider = FakeProvider([make_text_response("That expired.")])
     v.ask("yes")
     assert calls["n"] == 0
     assert v.pending_actions == []
@@ -586,15 +549,15 @@ def test_confirmation_bug_multi_tool_boundary():
     registry.register(Tool(name="__test_mt_destroy__", description="", parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}, handler=destroy, risk=RISK_DESTRUCTIVE))
     registry.register(Tool(name="__test_mt_after__", description="", parameters={"type": "object", "properties": {"app_name": {"type": "string"}}, "required": ["app_name"]}, handler=never_run, risk=RISK_SAFE))
 
-    v = _make_test_brain([_FakeResponse(_FakeMessage(None, tool_calls=[
-        _FakeToolCall("__test_mt_open__", '{"app_name": "explorer"}', "c1"),
-        _FakeToolCall("__test_mt_destroy__", '{"path": "old_project"}', "c2"),
-        _FakeToolCall("__test_mt_after__", '{"app_name": "vscode"}', "c3"),
-    ]))])
+    v = _make_test_brain([make_tool_call_response([
+        ("__test_mt_open__", json.loads('{"app_name": "explorer"}'), "c1"),
+        ("__test_mt_destroy__", json.loads('{"path": "old_project"}'), "c2"),
+        ("__test_mt_after__", json.loads('{"app_name": "vscode"}'), "c3")
+    ])])
     reply = v.ask("find my old project, delete it, and open vscode")
     assert executed == ["open:explorer"], f"Expected only the safe tool to run, got: {executed}"
     assert v.pending_actions
-    assert v.client.call_count == 1
+    assert v.provider.call_count == 1
     print("test_confirmation_bug_multi_tool_boundary: PASS")
 
 
@@ -615,17 +578,17 @@ def test_batch_confirmation_covers_multiple_files_in_one_request():
         handler=spy_delete, risk=RISK_DESTRUCTIVE,
     ))
 
-    v = _make_test_brain([_FakeResponse(_FakeMessage(None, tool_calls=[
-        _FakeToolCall("__test_batch_delete__", '{"path": "4.txt"}', "c1"),
-        _FakeToolCall("__test_batch_delete__", '{"path": "5.txt"}', "c2"),
-    ]))])
+    v = _make_test_brain([make_tool_call_response([
+        ("__test_batch_delete__", json.loads('{"path": "4.txt"}'), "c1"),
+        ("__test_batch_delete__", json.loads('{"path": "5.txt"}'), "c2")
+    ])])
     reply = v.ask("delete 4.txt and 5.txt")
 
     assert "4.txt" in reply and "5.txt" in reply, f"Confirmation must mention both files: {reply}"
     assert len(v.pending_actions) == 2, f"Expected 2 pending actions, got {len(v.pending_actions)}"
     assert deleted == [], "Neither file should be deleted yet"
 
-    v.client = _CountingScriptedClient([])  # confirming must not call the model at all
+    v.provider = FakeProvider([])  # confirming must not call the model at all
     v.ask("yes")
     assert deleted == ["4.txt", "5.txt"], f"Both files should be deleted after one confirmation, got: {deleted}"
     assert v.pending_actions == []
@@ -651,30 +614,30 @@ def test_confirmation_resume_never_leaks_internal_notes():
     forbidden_markers = ["[System note", "System note:", "was confirmed and executed"]
 
     # Confirmed branch
-    v = _make_test_brain([_FakeResponse(_FakeMessage(None, tool_calls=[
-        _FakeToolCall("__test_leak_delete__", '{"path": "leak_test.txt"}', "c1")
-    ]))])
+    v = _make_test_brain([make_tool_call_response([
+        ("__test_leak_delete__", json.loads('{"path": "leak_test.txt"}'), "c1")
+    ])])
     v.ask("delete leak_test.txt")
     # No model call is scripted for the "yes" turn - if the code tried to
     # call the model here, this test would raise StopIteration and fail,
     # which itself proves the confirm branch is now fully model-call-free.
-    v.client = _CountingScriptedClient([])
+    v.provider = FakeProvider([])
     reply = v.ask("yes")
     for marker in forbidden_markers:
         assert marker not in reply, f"Leaked internal text found in reply: {reply!r}"
-    assert v.client.call_count == 0, "Confirmed branch must not call the model at all"
+    assert v.provider.call_count == 0, "Confirmed branch must not call the model at all"
     print("test_confirmation_resume_never_leaks_internal_notes (confirmed): PASS")
 
     # Rejected branch
-    v2 = _make_test_brain([_FakeResponse(_FakeMessage(None, tool_calls=[
-        _FakeToolCall("__test_leak_delete__", '{"path": "leak_test2.txt"}', "c2")
-    ]))])
+    v2 = _make_test_brain([make_tool_call_response([
+        ("__test_leak_delete__", json.loads('{"path": "leak_test2.txt"}'), "c2")
+    ])])
     v2.ask("delete leak_test2.txt")
-    v2.client = _CountingScriptedClient([])
+    v2.provider = FakeProvider([])
     reply2 = v2.ask("no")
     for marker in forbidden_markers:
         assert marker not in reply2
-    assert v2.client.call_count == 0, "Rejected branch must not call the model at all"
+    assert v2.provider.call_count == 0, "Rejected branch must not call the model at all"
     print("test_confirmation_resume_never_leaks_internal_notes (rejected): PASS")
 
 

@@ -1,22 +1,19 @@
 """
-The "brain" of JARVIS: sends messages to Groq's free API (OpenAI-compatible),
-handles tool calls, and returns a final spoken-ready text response.
-
-Groq is used here instead of the Claude API directly because it has a genuinely
-free tier (no credit card needed). Swap back to Anthropic later any time you want -
-the tool-calling logic is nearly identical, just different SDK/response shapes.
+The "brain" of V: sends messages through a model-provider abstraction
+(providers/), handles tool calls, and returns a final spoken-ready text
+response. The brain does not know or care which LLM provider is underneath -
+it only talks to the ModelProvider interface (see providers/base.py).
 """
 
 import os
 import json
 import time
 import re
-from openai import OpenAI
 import tools  # noqa: F401 - importing triggers each tool's @register_tool decorator
 from tool_registry import registry
 import memory_store
-
-MODEL = "openai/gpt-oss-120b"  # Groq's free-tier flagship model (llama-3.3-70b was deprecated)
+from providers import create_model_provider
+from providers.base import ModelProviderError
 
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "conversation_history.json")
 HISTORY_BACKUP_FILE = os.path.join(os.path.dirname(__file__), "conversation_history.json.bak")
@@ -30,13 +27,12 @@ CONTEXT_TOKEN_BUDGET = int(os.getenv("V_CONTEXT_TOKEN_BUDGET", "6000"))
 RECENT_MESSAGES_KEEP = int(os.getenv("V_RECENT_MESSAGES_KEEP", "12"))  # never trimmed/summarized
 MEMORY_RETRIEVAL_LIMIT = int(os.getenv("V_MEMORY_RETRIEVAL_LIMIT", "5"))
 
-# Response generation controls - the free-tier Groq model has been observed
-# to occasionally ramble into long, repeated text on open-ended replies with
-# no bound on length. max_tokens caps how long any single reply can get;
-# frequency_penalty directly discourages the model from repeating the same
-# phrase over and over within one response.
+# Response generation controls - passed through to whatever provider is
+# active; a provider uses what it supports and ignores the rest. Guards
+# against the model rambling into long, repeated text on open-ended replies.
 RESPONSE_MAX_TOKENS = int(os.getenv("V_RESPONSE_MAX_TOKENS", "300"))
 RESPONSE_FREQUENCY_PENALTY = float(os.getenv("V_RESPONSE_FREQUENCY_PENALTY", "0.6"))
+
 
 # Words/phrases that count as confirming or rejecting a pending action. Kept
 # as simple substring checks rather than a classifier - good enough for a
@@ -160,16 +156,16 @@ flow of conversation and won't include everything discussed recently.
 
 
 class JarvisBrain:
-    def __init__(self, api_key: str = None):
-        # Groq's API is OpenAI-compatible, so we just point the OpenAI client
-        # at Groq's base URL instead of OpenAI's.
-        self.client = OpenAI(
-            api_key=api_key or os.getenv("GROQ_API_KEY"),
-            base_url="https://api.groq.com/openai/v1",
-        )
+    def __init__(self, api_key: str = None, provider=None):
+        # Brain depends on the ModelProvider interface, not a specific SDK -
+        # a provider can be injected directly (used by tests), or built from
+        # config via create_model_provider() otherwise.
+        self.provider = provider or create_model_provider(api_key=api_key)
+
         # Full provenance-tagged turn log (persisted to disk, capped at save
-        # time) - separate from self.history, which is the raw OpenAI-format
-        # list actually sent to the API and subject to live context trimming.
+        # time) - separate from self.history, which is the neutral message
+        # list actually sent through the provider and subject to live
+        # context trimming.
         self.session_summary, self.provenance = self._load_session_history()
 
         # System message is NOT stored statically - it's rebuilt fresh on
@@ -352,14 +348,13 @@ class JarvisBrain:
             f"Conversation excerpt:\n{transcript}"
         )
         try:
-            response = self.client.chat.completions.create(
-                model=MODEL,
+            response = self.provider.generate(
                 messages=[{"role": "user", "content": instruction}],
                 max_tokens=RESPONSE_MAX_TOKENS,
                 frequency_penalty=RESPONSE_FREQUENCY_PENALTY,
             )
-            return (response.choices[0].message.content or "").strip()
-        except Exception:
+            return (response.text or "").strip()
+        except ModelProviderError:
             # If summarization itself fails, better to lose old detail than
             # crash the interaction - the recent tail is still intact.
             return ""
@@ -507,14 +502,12 @@ class JarvisBrain:
             # ordinary request, handled normally below.
             self._record_turn("user", user_text, source="user", verified=True)
 
-        response = self.client.chat.completions.create(
-            model=MODEL,
+        response = self.provider.generate(
             messages=self.history,
             tools=registry.get_llm_tools(),
             max_tokens=RESPONSE_MAX_TOKENS,
             frequency_penalty=RESPONSE_FREQUENCY_PENALTY,
         )
-        message = response.choices[0].message
 
         last_tool_result = None
         awaiting_confirmation = False
@@ -523,18 +516,17 @@ class JarvisBrain:
         tool_calls_happened = False
         last_tool_outcome_type = "none"  # none | success | error | timeout
 
-        # Keep handling tool calls until the model gives a final text answer
-        while message.tool_calls:
-            self.history.append(message.model_dump(exclude_none=True))
+        # Keep handling tool calls until the model gives a final text answer.
+        # `response` here is always a normalized ModelResponse - brain.py
+        # never touches a provider SDK's own object shape.
+        while response.tool_calls:
+            self.history.append(response.raw_assistant_message)
 
             blocked_this_batch = False
-            for tool_call in message.tool_calls:
-                try:
-                    args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
+            for tool_call in response.tool_calls:  # list[ToolCall] - id/name/arguments already parsed
+                args = tool_call.arguments
 
-                tool = registry.get(tool_call.function.name)
+                tool = registry.get(tool_call.name)
 
                 if blocked_this_batch and not (tool and tool.requires_confirmation):
                     # A prior tool call in this same batch already hit a
@@ -551,7 +543,7 @@ class JarvisBrain:
                         "action in this request."
                     )
                 else:
-                    outcome = registry.execute(tool_call.function.name, args)
+                    outcome = registry.execute(tool_call.name, args)
                     tool_calls_happened = True
                     if outcome["success"]:
                         result_text = outcome["result"]
@@ -588,23 +580,21 @@ class JarvisBrain:
                 # then end the turn immediately without any further API call.
                 self.pending_actions = batch_pending_actions
                 confirmation_message = self._build_confirmation_prompt(batch_pending_actions)
-                message = None
+                response = None
                 break
 
-            response = self.client.chat.completions.create(
-                model=MODEL,
+            response = self.provider.generate(
                 messages=self.history,
                 tools=registry.get_llm_tools(),
                 max_tokens=RESPONSE_MAX_TOKENS,
                 frequency_penalty=RESPONSE_FREQUENCY_PENALTY,
             )
-            message = response.choices[0].message
 
         if confirmation_message is not None:
             final_text = confirmation_message
             grounded, tool_outcome_prov = True, "confirmation_required"
         else:
-            final_text = (message.content or "").strip()
+            final_text = (response.text or "").strip()
             if not final_text and last_tool_result:
                 # The model completed a tool action but returned no text to speak -
                 # never let V go silent after actually doing something. Fall back
